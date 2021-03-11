@@ -1,177 +1,60 @@
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn import functional as F
+import math
 
-
-class GraphAttentionLayer(nn.Module):
-    """
-    Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
-    """
-    def __init__(self, in_features, out_features, dropout, alpha, concat=True):
-        super(GraphAttentionLayer, self).__init__()
-        self.dropout = dropout
-        self.in_features = in_features
-        self.out_features = out_features
-        self.alpha = alpha
-        self.concat = concat
-
-        self.W = nn.Parameter(torch.empty(size=(in_features, out_features)))
-        nn.init.xavier_uniform_(self.W.data, gain=1.414)
-        self.a = nn.Parameter(torch.empty(size=(2*out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
-
+class GATMutiHeadAttLayer(nn.Module):
+    def __init__(self, in_features, out_features, heads, dropout=0.4, alpha=0.2, concat=True):
+        super(GATMutiHeadAttLayer,self).__init__()
+        self.dropout       = dropout        # drop prob = 0.6
+        self.in_features   = in_features    # 
+        self.out_features  = out_features   # 
+        self.heads         = heads          #
+        self.alpha         = alpha          # LeakyReLU with negative input slope, alpha = 0.2 
+        self.concat        = concat         # concat all heads or calculate average
+        #leaky relu
+        self.gain = nn.init.calculate_gain('leaky_relu', self.alpha)
         self.leakyrelu = nn.LeakyReLU(self.alpha)
 
-    def forward(self, h, adj):
-        Wh = torch.mm(h, self.W) # h.shape: (N, in_features), Wh.shape: (N, out_features)
-        a_input = self._prepare_attentional_mechanism_input(Wh)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))
-
-        zero_vec = -9e15*torch.ones_like(e)
-        attention = torch.where(adj > 0, e, zero_vec)
-        attention = F.softmax(attention, dim=1)
-        attention = F.dropout(attention, self.dropout, training=self.training)
-        h_prime = torch.matmul(attention, Wh)
-
-        if self.concat:
-            return F.elu(h_prime)
-        else:
-            return h_prime
-
-    def _prepare_attentional_mechanism_input(self, Wh):
-        N = Wh.size()[0] # number of nodes
-
-        # Below, two matrices are created that contain embeddings in their rows in different orders.
-        # (e stands for embedding)
-        # These are the rows of the first matrix (Wh_repeated_in_chunks): 
-        # e1, e1, ..., e1,            e2, e2, ..., e2,            ..., eN, eN, ..., eN
-        # '-------------' -> N times  '-------------' -> N times       '-------------' -> N times
-        # 
-        # These are the rows of the second matrix (Wh_repeated_alternating): 
-        # e1, e2, ..., eN, e1, e2, ..., eN, ..., e1, e2, ..., eN 
-        # '----------------------------------------------------' -> N times
-        # 
-        
-        Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=0)
-        Wh_repeated_alternating = Wh.repeat(N, 1)
-        # Wh_repeated_in_chunks.shape == Wh_repeated_alternating.shape == (N * N, out_features)
-
-        # The all_combination_matrix, created below, will look like this (|| denotes concatenation):
-        # e1 || e1
-        # e1 || e2
-        # e1 || e3
-        # ...
-        # e1 || eN
-        # e2 || e1
-        # e2 || e2
-        # e2 || e3
-        # ...
-        # e2 || eN
-        # ...
-        # eN || e1
-        # eN || e2
-        # eN || e3
-        # ...
-        # eN || eN
-
-        all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=1)
-        # all_combinations_matrix.shape == (N * N, 2 * out_features)
-
-        return all_combinations_matrix.view(N, N, 2 * self.out_features)
-
-    def __repr__(self):
-        return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
-
-
-class SpecialSpmmFunction(torch.autograd.Function):
-    """Special function for only sparse region backpropataion layer."""
-    @staticmethod
-    def forward(ctx, indices, values, shape, b):
-        assert indices.requires_grad == False
-        a = torch.sparse_coo_tensor(indices, values, shape)
-        ctx.save_for_backward(a, b)
-        ctx.N = shape[0]
-        return torch.matmul(a, b)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        a, b = ctx.saved_tensors
-        grad_values = grad_b = None
-        if ctx.needs_input_grad[1]:
-            grad_a_dense = grad_output.matmul(b.t())
-            edge_idx = a._indices()[0, :] * ctx.N + a._indices()[1, :]
-            grad_values = grad_a_dense.view(-1)[edge_idx]
-        if ctx.needs_input_grad[3]:
-            grad_b = a.t().matmul(grad_output)
-        return None, grad_values, None, grad_b
-
-
-class SpecialSpmm(nn.Module):
-    def forward(self, indices, values, shape, b):
-        return SpecialSpmmFunction.apply(indices, values, shape, b)
-
+        # Xavier Initialization of Weights
+        self.W = nn.Parameter(torch.zeros(size=(heads, in_features, out_features)))
+        nn.init.xavier_uniform_(self.W.data, self.gain)
+        self.a_1 = nn.Parameter(torch.zeros(size=(heads, out_features, 1)))
+        nn.init.xavier_uniform_(self.a_1.data, self.gain)
+        self.a_2 = nn.Parameter(torch.zeros(size=(heads, out_features, 1)))
+        nn.init.xavier_uniform_(self.a_2.data, self.gain)
     
-class SpGraphAttentionLayer(nn.Module):
-    """
-    Sparse version GAT layer, similar to https://arxiv.org/abs/1710.10903
-    """
+    def forward(self, input_seq, adj):
+        if(len(input_seq.size())==2):
+            input_seq = torch.unsqueeze(input_seq, 0)
+            adj = torch.unsqueeze(adj, 0)
+        input_seq = torch.unsqueeze(input_seq, 1)
+        adj = torch.unsqueeze(adj, 1)
+        in_size = input_seq.size()
+        nbatchs = in_size[0]
+        slen = in_size[2]
+        #transform the input features into higher-level feature
+        h = torch.matmul(input_seq, self.W)
+        #calculate the attention,divide the a*(hi,hj) into [a_1*h]+[a_2*h]
+        f_1 = torch.matmul(h, self.a_1)
+        f_2 = torch.matmul(h, self.a_2)
+        e = f_1.expand(nbatchs, self.heads, slen, slen) + f_2.expand(nbatchs, self.heads, slen, slen).transpose(2,3)
+        e = self.leakyrelu(e)
 
-    def __init__(self, in_features, out_features, dropout, alpha, concat=True):
-        super(SpGraphAttentionLayer, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.alpha = alpha
-        self.concat = concat
-
-        self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
-        nn.init.xavier_normal_(self.W.data, gain=1.414)
-                
-        self.a = nn.Parameter(torch.zeros(size=(1, 2*out_features)))
-        nn.init.xavier_normal_(self.a.data, gain=1.414)
-
-        self.dropout = nn.Dropout(dropout)
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
-        self.special_spmm = SpecialSpmm()
-
-    def forward(self, input, adj):
-        dv = 'cuda' if input.is_cuda else 'cpu'
-
-        N = input.size()[0]
-        edge = adj.nonzero().t()
-
-        h = torch.mm(input, self.W)
-        # h: N x out
-        assert not torch.isnan(h).any()
-
-        # Self-attention on the nodes - Shared attention mechanism
-        edge_h = torch.cat((h[edge[0, :], :], h[edge[1, :], :]), dim=1).t()
-        # edge: 2*D x E
-
-        edge_e = torch.exp(-self.leakyrelu(self.a.mm(edge_h).squeeze()))
-        assert not torch.isnan(edge_e).any()
-        # edge_e: E
-
-        e_rowsum = self.special_spmm(edge, edge_e, torch.Size([N, N]), torch.ones(size=(N,1), device=dv))
-        # e_rowsum: N x 1
-
-        edge_e = self.dropout(edge_e)
-        # edge_e: E
-
-        h_prime = self.special_spmm(edge, edge_e, torch.Size([N, N]), h)
-        assert not torch.isnan(h_prime).any()
-        # h_prime: N x out
-        
-        h_prime = h_prime.div(e_rowsum)
-        # h_prime: N x out
-        assert not torch.isnan(h_prime).any()
-
-        if self.concat:
-            # if this layer is not last layer,
-            return F.elu(h_prime)
+        # softmax the attention and drop
+        zero_vec  = -9e15*torch.ones_like(e)
+        attention = torch.where(adj.expand(nbatchs, self.heads, slen, slen) > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=2)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+        # calculate the nodes vector
+        node_out=torch.matmul(attention, h)
+        # concate all heads or heads average
+        if(self.concat):
+            node_out=node_out.transpose(1,2).contiguous().view(nbatchs,slen,-1)
+            node_out=F.elu(node_out)
         else:
-            # if this layer is last layer,
-            return h_prime
-
-    def __repr__(self):
+            node_out=node_out.mean(1)
+        return node_out.squeeze()
+def __repr__(self):
         return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
+        

@@ -2,7 +2,6 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-
 def encode_onehot(labels):
     # The classes must be sorted before encoding to enable static class encoding.
     # In other words, make sure the first class always maps to index 0.
@@ -10,16 +9,14 @@ def encode_onehot(labels):
     classes_dict = {c: np.identity(len(classes))[i, :] for i, c in enumerate(classes)}
     labels_onehot = np.array(list(map(classes_dict.get, labels)), dtype=np.int32)
     return labels_onehot
-
-
-def load_data(path="./data/cora/", dataset="cora"):
+def load_data(path="./coradata/", dataset="cora"):
     """Load citation network dataset (cora only for now)"""
     print('Loading {} dataset...'.format(dataset))
 
     idx_features_labels = np.genfromtxt("{}{}.content".format(path, dataset), dtype=np.dtype(str))
     features = sp.csr_matrix(idx_features_labels[:, 1:-1], dtype=np.float32)
     labels = encode_onehot(idx_features_labels[:, -1])
-
+    print(labels.shape)
     # build graph
     idx = np.array(idx_features_labels[:, 0], dtype=np.int32)
     idx_map = {j: i for i, j in enumerate(idx)}
@@ -72,4 +69,3 @@ def accuracy(output, labels):
     correct = preds.eq(labels).double()
     correct = correct.sum()
     return correct / len(labels)
-
